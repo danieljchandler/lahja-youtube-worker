@@ -2,15 +2,12 @@ import os
 import tempfile
 import uuid
 
+import requests
 import runpod
 import yt_dlp
-from supabase import create_client
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
-SUPABASE_BUCKET = os.environ["SUPABASE_BUCKET"]
-
-supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+SUPABASE_FUNCTION_URL = os.environ["SUPABASE_FUNCTION_URL"]  # e.g. https://ovscskaijvclaxelkdyf.supabase.co/functions/v1/receive-audio
+RUNPOD_CALLBACK_SECRET = os.environ["RUNPOD_CALLBACK_SECRET"]
 
 ERROR_KEYWORDS = {
     "private video": "Video is private",
@@ -68,35 +65,39 @@ def handler(job):
         thumbnail = info.get("thumbnail", "")
         channel = info.get("uploader") or info.get("channel", "")
 
-        audio_filename = f"{video_id}.opus"
-        audio_path = os.path.join(tmpdir, audio_filename)
+        audio_path = os.path.join(tmpdir, f"{video_id}.opus")
 
         if not os.path.exists(audio_path):
-            candidates = [
-                f for f in os.listdir(tmpdir) if f.endswith(".opus")
-            ]
+            candidates = [f for f in os.listdir(tmpdir) if f.endswith(".opus")]
             if not candidates:
                 return {"error": "Audio file not found after download"}
             audio_path = os.path.join(tmpdir, candidates[0])
 
-        storage_path = f"youtube/{video_id}/{uuid.uuid4()}.opus"
-
         try:
             with open(audio_path, "rb") as audio_file:
-                supabase.storage.from_(SUPABASE_BUCKET).upload(
-                    storage_path,
-                    audio_file,
-                    {"content-type": "audio/ogg; codecs=opus"},
+                response = requests.post(
+                    SUPABASE_FUNCTION_URL,
+                    headers={"Authorization": f"Bearer {RUNPOD_CALLBACK_SECRET}"},
+                    files={"audio": (f"{video_id}.opus", audio_file, "audio/ogg; codecs=opus")},
+                    data={
+                        "video_id": video_id,
+                        "source_url": youtube_url,
+                        "title": title,
+                        "duration": str(duration) if duration else "",
+                        "thumbnail": thumbnail,
+                        "channel": channel,
+                    },
+                    timeout=120,
                 )
+            response.raise_for_status()
+            result = response.json()
+        except requests.HTTPError as exc:
+            return {"error": f"Edge function error {exc.response.status_code}: {exc.response.text}"}
         except Exception as exc:
             return {"error": f"Upload failed: {exc}"}
 
-        storage_url = (
-            f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{storage_path}"
-        )
-
         return {
-            "storage_url": storage_url,
+            "storage_url": result.get("storage_url"),
             "video_id": video_id,
             "title": title,
             "duration": duration,
